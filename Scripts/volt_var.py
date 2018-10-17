@@ -40,56 +40,99 @@ from svpelab import das
 from svpelab import der
 from svpelab import pvsim
 from svpelab import hil
+from svpelab import gridsim
 import script
 import numpy as np
 
 def test_run():
+    eut = None
+    chil = None
+    grid = None
+    pv = None
+    result_summary = None
+    result = script.RESULT_FAIL
 
-    # Initialize DER configuration
-    eut = der.der_init(ts)
-    eut.config()
-
-    # Initialize CHIL environment, if necessary
-    chil = hil.hil_init(ts)
-    if chil is not None:
-        chil.config()
-
-    # PV simulator is initialized with test parameters and enabled
-    pv = pvsim.pvsim_init(ts)
-    pv.irradiance_set(1000)
-    pv.power_on()
-
-    # grid simulator is initialized with test parameters and enabled
-    grid = gridsim.gridsim_init(ts)
-    # sometimes when there's a xfmr between the gridsim and EUT, V_nom at EUT != V_nom_grid (gridsim nominal)
     try:
-        v_nom_grid = grid.v_nom_param
+        v_nom = ts.param_value('test.v_nom')
+
+        # Initialize DER configuration
+        eut = der.der_init(ts)
+        eut.config()
+
+        # Initialize CHIL environment, if necessary
+        chil = hil.hil_init(ts)
+        if chil is not None:
+            chil.config()
+
+        # PV simulator is initialized with test parameters and enabled
+        pv = pvsim.pvsim_init(ts)
+        pv.irradiance_set(800)
+        pv.power_on()
+
+        # grid simulator is initialized with test parameters and enabled
+        grid = gridsim.gridsim_init(ts)
+        # sometimes when there's a xfmr between the gridsim and EUT, V_nom at EUT != V_nom_grid (gridsim nominal)
+        try:
+            v_nom_grid = grid.v_nom_param
+        except Exception, e:
+            v_nom_grid = v_nom
+
+        # Get EUT nameplate power
+        eut_nameplate_power = eut.nameplate().get('WRtg')
+
+        inv_power = eut.measurements().get('W')
+        timeout = 120.
+        if inv_power <= eut_nameplate_power/10.:
+            eut.connect(params={'Conn': True})
+            pv.irradiance_set(800)  # Perturb the pv slightly to start the inverter
+        while inv_power <= eut_nameplate_power/10. and timeout >= 0:
+            ts.log('Inverter power is at %0.1f. Waiting %s more seconds or until EUT starts...' % (inv_power, timeout))
+            ts.sleep(1)
+            timeout -= 1
+            inv_power = eut.measurements().get('W')
+            if timeout == 0:
+                result = script.RESULT_FAIL
+                raise der.DERError('Inverter did not start.')
+
+        eut.volt_var_curve(1, params={'v': [95, 98, 102, 105], 'var': [100, 0, 0, -100]})
+        eut.volt_var(params={'ActCrv': 1, 'Ena': True})
+        parameters = eut.volt_var()
+        ts.log_debug('EUT VV settings (readback): %s' % parameters)
+
+        # Create list of voltages to iterate over
+        voltage_values = list(np.linspace(95, 105, num=50))
+        sleep_time = 1.
+        for voltage in voltage_values:
+            v = ((voltage/100.) * v_nom_grid)
+            grid.voltage(v)  # set grid voltage
+            ts.log('      V = %0.3f V (%0.3f%%). Sleeping for %0.2f seconds...' % (v, voltage, sleep_time))
+            ts.sleep(sleep_time)
+
+        # Disable the VV function
+        eut.volt_var(params={'Ena': False})
+        ts.log('VV Disabled')
+
+        # Close the connection to the CHIL
+        if chil is not None:
+            chil.close()
+
+        result = script.RESULT_COMPLETE
+
     except Exception, e:
-        v_nom_grid = v_nom
+        ts.log_error('Script failure: %s' % e)
 
-    eut.volt_var_curve(1, params={'v': [95, 98, 102, 105], 'var': [100, 0, 0, -100]})
-    eut.volt_var(params={'ActCrv': 1, 'Ena': True})
-    parameters = eut.volt_var()
-    ts.log_debug('EUT VV settings (readback): %s' % parameters)
+    finally:
+        if eut is not None:
+            eut.volt_var(params={'Ena': False})
+            eut.close()
+        if chil is not None:
+            chil.close()
+        if pv is not None:
+            pv.close()
+        if grid is not None:
+            grid.close()
 
-    # Create list of voltages to iterate over
-    voltage_values = list(np.linspace(92, 108, num=50))
-    sleep_time = 0.5
-    for voltage in voltage_values:
-        v = (voltage/v_nom * v_nom_grid)
-        grid.voltage(v)  # set grid voltage
-        ts.log('      V = %0.3f V (%0.3f%%). Sleeping for %0.2f seconds...' % (v, voltage, sleep_time))
-        ts.sleep(sleep_time)
-
-    # Disable the VV function
-    eut.volt_var(params={'Ena': False})
-    ts.log('VV Disabled')
-
-    # Close the connection to the CHIL
-    if chil is not None:
-        chil.close()
-
-    return script.RESULT_COMPLETE
+    return result
 
 def run(test_script):
 
