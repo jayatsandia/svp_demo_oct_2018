@@ -44,79 +44,114 @@ import script
 import numpy as np
 
 def test_run():
+    eut = None
+    chil = None
+    pv = None
+    result = script.RESULT_FAIL
 
-    # Get the parameters for the test from the UI
-    pf_start = ts.param_value('test.pf_start')
-    pf_end = ts.param_value('test.pf_stop')
-    steps = ts.param_value('test.pf_steps_per_side')
-    sleep_time = ts.param_value('test.wait_time')
+    try:
+        # Get the parameters for the test from the UI
+        pf_start = ts.param_value('test.pf_start')
+        pf_end = ts.param_value('test.pf_stop')
+        steps = ts.param_value('test.pf_steps_per_side')
+        sleep_time = ts.param_value('test.wait_time')
 
-    # Initialize DER configuration
-    eut = der.der_init(ts)
-    eut.config()
+        # Initialize DER configuration
+        eut = der.der_init(ts)
+        eut.config()
 
-    # Initialize CHIL environment, if necessary
-    chil = hil.hil_init(ts)
-    if chil is not None:
-        chil.config()
+        # Initialize CHIL environment, if necessary
+        chil = hil.hil_init(ts)
+        if chil is not None:
+            chil.config()
 
-    # PV simulator is initialized with test parameters and enabled
-    pv = pvsim.pvsim_init(ts)
-    pv.irradiance_set(1000)
-    pv.power_on()
+        # PV simulator is initialized with test parameters and enabled
+        pv = pvsim.pvsim_init(ts)
+        pv.irradiance_set(800)
+        pv.power_on()
+        # Print information from the DER
+        ts.log('---')
+        info = eut.info()
+        if info is not None:
+            ts.log('DER info:')
+            ts.log('  Manufacturer: %s' % (info.get('Manufacturer')))
+            ts.log('  Model: %s' % (info.get('Model')))
+            ts.log('  Options: %s' % (info.get('Options')))
+            ts.log('  Version: %s' % (info.get('Version')))
+            ts.log('  Serial Number: %s' % (info.get('SerialNumber')))
+        else:
+            ts.log_warning('DER info not supported')
+        ts.log('---')
+        fixed_pf = eut.fixed_pf()
+        if fixed_pf is not None:
+            ts.log('DER fixed_pf:')
+            ts.log('  Ena: %s' % (fixed_pf.get('Ena')))
+            ts.log('  PF: %s' % (fixed_pf.get('PF')))
+            ts.log('  WinTms: %s' % (fixed_pf.get('WinTms')))
+            ts.log('  RmpTms: %s' % (fixed_pf.get('RmpTms')))
+            ts.log('  RvrtTms: %s' % (fixed_pf.get('RvrtTms')))
+        else:
+            ts.log_warning('DER fixed_pf not supported')
+        ts.log('---')
 
-    # Print information from the DER
-    ts.log('---')
-    info = eut.info()
-    if info is not None:
-        ts.log('DER info:')
-        ts.log('  Manufacturer: %s' % (info.get('Manufacturer')))
-        ts.log('  Model: %s' % (info.get('Model')))
-        ts.log('  Options: %s' % (info.get('Options')))
-        ts.log('  Version: %s' % (info.get('Version')))
-        ts.log('  Serial Number: %s' % (info.get('SerialNumber')))
-    else:
-        ts.log_warning('DER info not supported')
-    ts.log('---')
-    fixed_pf = eut.fixed_pf()
-    if fixed_pf is not None:
-        ts.log('DER fixed_pf:')
-        ts.log('  Ena: %s' % (fixed_pf.get('Ena')))
-        ts.log('  PF: %s' % (fixed_pf.get('PF')))
-        ts.log('  WinTms: %s' % (fixed_pf.get('WinTms')))
-        ts.log('  RmpTms: %s' % (fixed_pf.get('RmpTms')))
-        ts.log('  RvrtTms: %s' % (fixed_pf.get('RvrtTms')))
-    else:
-        ts.log_warning('DER fixed_pf not supported')
-    ts.log('---')
+        # Get EUT nameplate power
+        eut_nameplate_power = eut.nameplate().get('WRtg')
 
-    # disable volt/var curve
-    eut.volt_var(params={'Ena': False})
+        # disable volt/var, VW, FW
+        eut.volt_var(params={'Ena': False})
+        eut.volt_watt(params={'Ena': False})
+        eut.freq_watt(params={'Ena': False})
 
-    # Create list of the power factor values to iterate over
-    pf_values = list(np.linspace(pf_start, 1.0, num=steps)) + list(np.linspace(-1.0, pf_end, num=steps)[1:])
-    # ts.log('Setting DER to the following PF values: %s' % pf_values)
+        inv_power = eut.measurements().get('W')
+        timeout = 120.
+        if inv_power <= eut_nameplate_power / 10.:
+            pv.irradiance_set(800)  # Perturb the pv slightly to start the inverter
+            ts.sleep(3)
+            eut.connect(params={'Conn': True})
+        while inv_power <= eut_nameplate_power / 10. and timeout >= 0:
+            ts.log('Inverter power is at %0.1f. Waiting %s more seconds or until EUT starts...' % (inv_power, timeout))
+            ts.sleep(1)
+            timeout -= 1
+            inv_power = eut.measurements().get('W')
+            if timeout == 0:
+                result = script.RESULT_FAIL
+                raise der.DERError('Inverter did not start.')
 
-    # Run the test for 3 different irradiance values
-    for irr in [1000, 600, 300]:
-        pv.irradiance_set(irr)  # Set irradiance of the PV simulator
 
-        for pf in pf_values:
-            # Send PF setting to the equipment under test (EUT)
-            eut.fixed_pf(params={'Ena': True, 'PF': pf, 'WinTms': 0, 'RmpTms': 0, 'RvrtTms': 0})
-            ts.log('Power Factor set to %0.3f' % pf)
-            ts.log('      Sleeping for %0.2f seconds...' % sleep_time)
-            ts.sleep(sleep_time)
 
-    # Disable the PF function
-    eut.fixed_pf(params={'Ena': False})
-    ts.log('Power Factor Disabled')
+        # Create list of the power factor values to iterate over
+        pf_values = list(np.linspace(pf_start, 1.0, num=steps)) + list(np.linspace(-1.0, pf_end, num=steps)[1:])
+        # ts.log('Setting DER to the following PF values: %s' % pf_values)
 
-    # Close the connection to the CHIL tool
-    if chil is not None:
-        chil.close()
+        # Run the test for 3 different irradiance values
+        for irr in [1000, 600, 300]:
+            pv.irradiance_set(irr)  # Set irradiance of the PV simulator
 
-    return script.RESULT_COMPLETE
+            for pf in pf_values:
+                # Send PF setting to the equipment under test (EUT)
+                eut.fixed_pf(params={'Ena': True, 'PF': pf, 'WinTms': 0, 'RmpTms': 0, 'RvrtTms': 0})
+                ts.log('Power Factor set to %0.3f. Sleeping for %0.2f seconds...' % (pf, sleep_time))
+                ts.sleep(sleep_time)
+
+        # Disable the PF function
+        eut.fixed_pf(params={'Ena': False})
+        ts.log('Power Factor Disabled')
+
+        result = script.RESULT_COMPLETE
+
+    except Exception, e:
+        ts.log_error('Script failure: %s' % e)
+
+    finally:
+        if eut is not None:
+            eut.fixed_pf(params={'Ena': False})
+            eut.close()
+        if chil is not None:
+            chil.close()
+        if pv is not None:
+            pv.close()
+
+    return result
 
 def run(test_script):
 

@@ -37,20 +37,24 @@ import sys
 import os
 import traceback
 import math
-import time
 from svpelab import gridsim
 from svpelab import pvsim
 from svpelab import das
 from svpelab import der
 from svpelab import hil
+from svpelab import result as rslt
 import script
 import numpy as np
+
 
 def test_run():
 
     eut = None
     chil = None
     daq = None
+    pv = None
+    result_summary = None
+    result = script.RESULT_FAIL
 
     # result params
     result_params = {
@@ -58,7 +62,7 @@ def test_run():
         'plot.x.title': 'Time (sec)',
         'plot.x.points': 'TIME',
         'plot.y.points': 'W_TARG, W_TOTAL, W_INV',
-        'plot.y.title': 'EUT Power',
+        'plot.y.title': 'EUT Power (W)',
     }
 
     try:
@@ -71,6 +75,11 @@ def test_run():
         if chil is not None:
             chil.config()
 
+        # PV simulator is initialized with test parameters and enabled
+        pv = pvsim.pvsim_init(ts)
+        pv.irradiance_set(1000)
+        pv.power_on()
+
         # Initialize data acquisition with soft channels (sc) that include data that doesn't come from the DAQ
         sc_points = ['W_TARG', 'W_TOTAL', 'W_INV']
         daq = das.das_init(ts, sc_points=sc_points)
@@ -81,19 +90,34 @@ def test_run():
         result_summary = open(ts.result_file_path(result_summary_filename), 'a+')  # Open .csv file
         ts.result_file(result_summary_filename)  # create result file in the GUI
         # Write result summary header
-        result_summary.write('Test Name, Power Setting (%), Inverter-Reported Power (W), DAS Power (W)\n')
+        result_summary.write('Test Name, Power Setting (%), Inverter-Reported Power (W), DAS Power (W), '
+                             'Inverter-Reported Power (%), DAS Power (%)\n')
 
         # Get EUT nameplate power
         eut_nameplate_power = eut.nameplate().get('WRtg')
 
-        for time_loop in range(10):
+        inv_power = eut.measurements().get('W')
+        timeout = 20.
+        if inv_power <= eut_nameplate_power/10.:
+            eut.connect(params={'Conn': True})
+            pv.irradiance_set(995)  # Perturb the pv slightly to start the inverter
+        while inv_power <= eut_nameplate_power/10. and timeout >= 0:
+            ts.log('Inverter power is at %0.1f. Waiting %s more seconds or until EUT starts...' % (inv_power, timeout))
+            ts.sleep(1)
+            timeout -= 1
+            inv_power = eut.measurements().get('W')
+            if timeout == 0:
+                result = script.RESULT_FAIL
+                raise der.DERError('Inverter did not start.')
+
+        for time_loop in range(2):
             daq.data_capture(True)  # Begin data capture for this power loop
 
             for power_limit_pct in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                 daq.sc['W_TARG'] = eut_nameplate_power*(float(power_limit_pct)/100.)
                 eut.limit_max_power(params={'Ena': True, 'WMaxPct': power_limit_pct})
                 ts.log('EUT power set to %0.2f%%' % power_limit_pct)
-                time.sleep(2)
+                ts.sleep(2)
                 daq.sc['W_INV'] = eut.measurements().get('W')  # Get the inverter-measured power and save it.
                 daq.data_sample()  # force a data capture point after the sleep and add this to the dataset
                 daq_data = daq.data_capture_read()  # read the last data point dictionary from the daq object
@@ -102,19 +126,23 @@ def test_run():
                 except Exception, e:  # if single phase device
                     daq.sc['W_TOTAL'] = daq_data['AC_P_1']
                 # Record 1 set of power values for each power level setting
-                result_summary.write('%s, %s, %s, %s\n' % (time_loop+1, power_limit_pct, daq.sc['W_INV'],
-                                                           daq.sc['W_TOTAL']))
+                result_summary.write('%s, %s, %s, %s, %s, %s\n' % (time_loop+1, power_limit_pct, daq.sc['W_INV'],
+                                                           daq.sc['W_TOTAL'], daq.sc['W_INV']/eut_nameplate_power,
+                                                           daq.sc['W_TOTAL']/eut_nameplate_power))
 
             daq.data_capture(False)  # Stop data capture
             ds = daq.data_capture_dataset()  # generate dataset from the daq data that was recorded
-            filename = 'CurtailmentRun_%s.csv' % (str(time_loop+1))  # Pick name for the DAS data
+            testname = 'CurtailmentRun_%s' % (str(time_loop+1))  # Pick name for the DAS data
+            filename = testname + '.csv'  # Pick name for the DAS .csv data file
             ds.to_csv(ts.result_file_path(filename))  # Convert data to .cvs file
             result_params['plot.title'] = testname  # update title for the excel plot for this dataset
             ts.result_file(filename, params=result_params)  # Add results info to .xml log, which will be used to plot
             ts.log('Saving data capture: %s' % filename)
 
+        result = script.RESULT_COMPLETE
+
     except Exception, e:
-        raise 'Script failure: %s' % e
+        ts.log_error('Script failure: %s' % e)
 
     finally:
         if eut is not None:
@@ -122,9 +150,12 @@ def test_run():
             eut.close()
         if chil is not None:
             chil.close()
+        if pv is not None:
+            pv.close()
         if daq is not None:
             daq.close()
-
+        if result_summary is not None:
+            result_summary.close()
         # create result workbook
         excelfile = ts.config_name() + '.xlsx'
         rslt.result_workbook(excelfile, ts.results_dir(), ts.result_dir())
@@ -163,6 +194,7 @@ info = script.ScriptInfo(name=os.path.basename(__file__), run=run, version='1.0.
 der.params(info)
 hil.params(info)
 das.params(info)
+pvsim.params(info)
 
 info.logo('sunspec.gif')
 
